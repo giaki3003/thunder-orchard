@@ -1486,7 +1486,7 @@ mod test {
                     vout: 0,
                 },
                 output: Output {
-                    address: Address([salt; 20]),
+                    address: TransparentAddress([salt; 20]),
                     content: OutputContent::Value(bitcoin::Amount::from_sat(
                         1000,
                     )),
@@ -1512,7 +1512,7 @@ mod test {
         block_info.insert(h2, b2);
         let tdp = TwoWayPegData { block_info };
 
-        let () = connect(&state, &mut rwtxn, &tdp)?;
+        let _accumulator = connect(&state, &mut rwtxn, &tdp)?;
         anyhow::ensure!(state.utxos.len(&rwtxn)? == 2);
         disconnect(&state, &mut rwtxn, &tdp)?;
 
