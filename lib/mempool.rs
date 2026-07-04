@@ -186,6 +186,12 @@ impl MemPool {
     }
 
     /// regenerate utreexo proofs for all txs in the mempool
+    ///
+    /// A transaction whose inputs can no longer be proven against the
+    /// accumulator (eg. because they were spent by a just-connected block via
+    /// a conflicting transaction) is no longer valid. Such a transaction is
+    /// evicted from the mempool, along with its descendants, rather than
+    /// propagating an error that would abort block connect/disconnect.
     pub fn regenerate_proofs(
         &self,
         rwtxn: &mut RwTxn,
@@ -193,15 +199,30 @@ impl MemPool {
     ) -> Result<(), Error> {
         let txids: Vec<_> = self.transactions.iter_keys(rwtxn)?.collect()?;
         for txid in txids {
-            let mut tx = self.transactions.get(rwtxn, &txid)?;
+            // The tx may already have been evicted as a descendant of an
+            // earlier invalidated tx.
+            let Some(mut tx) = self.transactions.try_get(rwtxn, &txid)? else {
+                continue;
+            };
             let targets: Vec<_> = tx
                 .transaction
                 .inputs
                 .iter()
                 .map(|(_, utxo_hash)| utxo_hash.into())
                 .collect();
-            tx.transaction.proof = accumulator.prove(&targets)?;
-            self.transactions.put(rwtxn, &txid, &tx)?;
+            match accumulator.prove(&targets) {
+                Ok(proof) => {
+                    tx.transaction.proof = proof;
+                    self.transactions.put(rwtxn, &txid, &tx)?;
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        "evicting mempool transaction {txid}: inputs no \
+                         longer in accumulator"
+                    );
+                    let () = self.delete(rwtxn, txid)?;
+                }
+            }
         }
         Ok(())
     }
