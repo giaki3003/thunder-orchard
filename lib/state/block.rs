@@ -849,4 +849,93 @@ mod test {
         }
         Ok(())
     }
+
+    /// A mempool transaction whose input can no longer be proven against the
+    /// accumulator (eg. because a conflicting transaction in a just-connected
+    /// block spent the same UTXO) is evicted by `regenerate_proofs`, together
+    /// with its descendants, instead of aborting block connect with an error.
+    /// Regression test for the mempool proof-regeneration node halt.
+    #[test]
+    fn regenerate_proofs_evicts_unprovable_txs() -> anyhow::Result<()> {
+        use bitcoin::hashes::Hash as _;
+        use rustreexo::accumulator::proof::Proof;
+
+        use crate::{
+            authorization::{SigningKey, get_address},
+            mempool::MemPool,
+            state::test::temp_env,
+            types::{
+                Accumulator, AuthorizedTransaction, OutPoint, Transaction,
+            },
+        };
+
+        let env = temp_env("regenerate_proofs_evicts_unprovable_txs")?;
+        let mempool = MemPool::new(&env)?;
+
+        let addr =
+            get_address(&SigningKey::from_bytes(&[0x33; 32]).verifying_key());
+
+        // Parent tx spends a deposit UTXO whose leaf is NOT in the accumulator.
+        let parent = AuthorizedTransaction {
+            transaction: Transaction {
+                inputs: vec![(
+                    OutPoint::Deposit(bitcoin::OutPoint {
+                        txid: bitcoin::Txid::from_byte_array([0xAB; 32]),
+                        vout: 0,
+                    }),
+                    [0x11; 32],
+                )],
+                proof: Proof::default(),
+                outputs: vec![value_output(addr, 1_000)],
+                orchard_bundle: None,
+            },
+            authorizations: Vec::new(),
+        };
+        let parent_txid = parent.transaction.txid();
+
+        // Child tx spends the parent's output, so it is a mempool descendant.
+        let child = AuthorizedTransaction {
+            transaction: Transaction {
+                inputs: vec![(
+                    OutPoint::Regular {
+                        txid: parent_txid,
+                        vout: 0,
+                    },
+                    [0x22; 32],
+                )],
+                proof: Proof::default(),
+                outputs: vec![value_output(addr, 900)],
+                orchard_bundle: None,
+            },
+            authorizations: Vec::new(),
+        };
+        let child_txid = child.transaction.txid();
+
+        {
+            let mut rwtxn = env.write_txn()?;
+            mempool.put(&mut rwtxn, &parent)?;
+            mempool.put(&mut rwtxn, &child)?;
+            rwtxn.commit()?;
+        }
+
+        // Regenerate against an empty accumulator: neither input leaf is
+        // present, so both txs are unprovable. `regenerate_proofs` must evict
+        // the parent (and, as its descendant, the child) and return `Ok`
+        // rather than error out and abort block connect.
+        {
+            let mut rwtxn = env.write_txn()?;
+            let accumulator = Accumulator::default();
+            mempool.regenerate_proofs(&mut rwtxn, &accumulator)?;
+            anyhow::ensure!(
+                !mempool.transactions.contains_key(&rwtxn, &parent_txid)?,
+                "unprovable parent tx should have been evicted",
+            );
+            anyhow::ensure!(
+                !mempool.transactions.contains_key(&rwtxn, &child_txid)?,
+                "descendant of an evicted tx should also be evicted",
+            );
+            rwtxn.commit()?;
+        }
+        Ok(())
+    }
 }
