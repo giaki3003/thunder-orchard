@@ -1133,7 +1133,29 @@ impl NetTask {
                                 &rwtxn,
                                 &mut new_tx.transaction,
                             )?;
-                            self.ctxt.mempool.put(&mut rwtxn, &new_tx)?;
+                            // A peer-relayed transaction may conflict with the
+                            // local mempool (double-spending an outpoint or
+                            // nullifier already held). Such conflicts are not
+                            // fatal to this node: drop the transaction without
+                            // relaying instead of terminating the net task.
+                            match self.ctxt.mempool.put(&mut rwtxn, &new_tx) {
+                                Ok(()) => {}
+                                Err(
+                                    err @ (mempool::Error::UtxoDoubleSpent {
+                                        ..
+                                    }
+                                    | mempool::Error::NullifierDoubleSpent {
+                                        ..
+                                    }),
+                                ) => {
+                                    tracing::warn!(
+                                        %addr,
+                                        "Dropping conflicting transaction from peer: {err}"
+                                    );
+                                    continue;
+                                }
+                                Err(err) => return Err(err.into()),
+                            }
                             rwtxn.commit().map_err(RwTxnError::from)?;
                             // broadcast
                             let () = self
