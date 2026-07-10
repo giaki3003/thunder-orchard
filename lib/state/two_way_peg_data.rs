@@ -1000,7 +1000,11 @@ fn disconnect_event(
                 &PointedOutput { outpoint, output },
             );
             accumulator_diff.remove(utxo_hash.into());
-            *latest_deposit_block_hash = Some(event_block_hash);
+            // Blocks are iterated in reverse here, so the first event block
+            // hash seen is the latest. Keep it to match what `connect` stored.
+            if latest_deposit_block_hash.is_none() {
+                *latest_deposit_block_hash = Some(event_block_hash);
+            }
         }
         BlockEvent::WithdrawalBundle(withdrawal_bundle_event) => {
             let () = disconnect_withdrawal_bundle_event(
@@ -1010,7 +1014,12 @@ fn disconnect_event(
                 accumulator_diff,
                 withdrawal_bundle_event,
             )?;
-            *latest_withdrawal_bundle_event_block_hash = Some(event_block_hash);
+            // Blocks are iterated in reverse here, so the first event block
+            // hash seen is the latest. Keep it to match what `connect` stored.
+            if latest_withdrawal_bundle_event_block_hash.is_none() {
+                *latest_withdrawal_bundle_event_block_hash =
+                    Some(event_block_hash);
+            }
         }
     }
     Ok(())
@@ -1123,7 +1132,7 @@ pub fn disconnect(
 
 #[cfg(test)]
 mod test {
-    use std::{collections::BTreeMap, sync::Arc};
+    use std::collections::BTreeMap;
 
     use bitcoin::{
         Network,
@@ -1138,7 +1147,7 @@ mod test {
             rollback::RollBack,
             test::{fresh_state, value_output},
             two_way_peg_data::{
-                collect_withdrawal_bundle, disconnect,
+                collect_withdrawal_bundle, connect, disconnect,
                 disconnect_withdrawal_bundle_failed,
             },
         },
@@ -1147,7 +1156,7 @@ mod test {
             OutputContent, TransparentAddress, Txid, WithdrawalBundle,
             WithdrawalBundleEvent, WithdrawalBundleEventStatus,
             WithdrawalBundleStatus,
-            proto::mainchain::{BlockEvent, BlockInfo, TwoWayPegData},
+            proto::mainchain::{BlockEvent, BlockInfo, Deposit, TwoWayPegData},
         },
     };
 
@@ -1155,7 +1164,7 @@ mod test {
     // the failure must spend them again
     #[test]
     fn disconnect_failed_bundle_spends_reinstated_utxo() -> anyhow::Result<()> {
-        let (env, state) =
+        let (_temp_dir, env, state) =
             fresh_state("disconnect_failed_bundle_spends_reinstated_utxo")?;
         let outpoint = OutPoint::Regular {
             txid: Txid::from([1; 32]),
@@ -1217,7 +1226,7 @@ mod test {
     #[test]
     fn disconnect_withdrawal_event_block_uses_correct_db() -> anyhow::Result<()>
     {
-        let (env, state) =
+        let (_temp_dir, env, state) =
             fresh_state("disconnect_withdrawal_event_block_uses_correct_db")?;
 
         let block_height = 5u32;
@@ -1306,7 +1315,7 @@ mod test {
         >,
         f: impl FnOnce(&State, &mut sneed::RwTxn<'_>) -> R,
     ) -> anyhow::Result<R> {
-        let (env, state) = fresh_state(test_name)?;
+        let (_temp_dir, env, state) = fresh_state(test_name)?;
         let res = {
             let mut rwtxn = env.write_txn()?;
             state.height.put(
@@ -1343,10 +1352,6 @@ mod test {
             }
             f(&state, &mut rwtxn)
         };
-        drop(state);
-        let env_path = Arc::clone(env.path());
-        drop(env);
-        drop(std::fs::remove_dir_all(env_path));
         Ok(res)
     }
 
@@ -1386,7 +1391,7 @@ mod test {
     fn deposit_reorg_round_trips() -> anyhow::Result<()> {
         use crate::types::{Body, Header, proto::mainchain::Deposit};
 
-        let (env, state) = fresh_state("deposit_reorg_round_trips")?;
+        let (_temp_dir, env, state) = fresh_state("deposit_reorg_round_trips")?;
         let empty_body = Body {
             coinbase: Vec::new(),
             transactions: Vec::new(),
@@ -1463,6 +1468,56 @@ mod test {
             rwtxn.commit()?;
         }
 
+        Ok(())
+    }
+
+    // A single two-way-peg batch can span multiple mainchain blocks. Connecting
+    // deposits from two distinct blocks then disconnecting the batch must
+    // restore the prior state. Before the fix, disconnect recomputed the latest
+    // deposit block hash by reverse iteration (yielding the oldest block) and
+    // panicked on the consistency assert against the newest hash connect stored.
+    #[test]
+    fn disconnect_two_deposit_blocks_restores_state() -> anyhow::Result<()> {
+        fn deposit_block(salt: u8) -> (bitcoin::BlockHash, BlockInfo) {
+            let dep = Deposit {
+                tx_index: 0,
+                outpoint: bitcoin::OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([salt; 32]),
+                    vout: 0,
+                },
+                output: Output {
+                    address: TransparentAddress([salt; 20]),
+                    content: OutputContent::Value(bitcoin::Amount::from_sat(
+                        1000,
+                    )),
+                },
+            };
+            (
+                bitcoin::BlockHash::from_byte_array([salt; 32]),
+                BlockInfo {
+                    bmm_commitment: None,
+                    events: vec![BlockEvent::Deposit(dep)],
+                },
+            )
+        }
+        let (_temp_dir, env, state) =
+            fresh_state("disconnect_two_deposit_blocks_restores_state")?;
+        let mut rwtxn = env.write_txn()?;
+        state.height.put(&mut rwtxn, &(), &10)?;
+
+        let mut block_info = LinkedHashMap::new();
+        let (h1, b1) = deposit_block(1);
+        let (h2, b2) = deposit_block(2);
+        block_info.insert(h1, b1);
+        block_info.insert(h2, b2);
+        let tdp = TwoWayPegData { block_info };
+
+        let _accumulator = connect(&state, &mut rwtxn, &tdp)?;
+        anyhow::ensure!(state.utxos.len(&rwtxn)? == 2);
+        disconnect(&state, &mut rwtxn, &tdp)?;
+
+        anyhow::ensure!(state.utxos.len(&rwtxn)? == 0);
+        anyhow::ensure!(state.deposit_blocks.len(&rwtxn)? == 0);
         Ok(())
     }
 }

@@ -68,6 +68,9 @@ utoipa = { workspace = true, features = ["macros", "non_strict_integers"] }
 zcash_note_encryption = { workspace = true }
 zip32 = { workspace = true }
 
+[dev-dependencies]
+temp-dir = { workspace = true }
+
 [features]
 clap = ["dep:clap"]
 
