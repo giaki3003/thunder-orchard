@@ -42,6 +42,8 @@ pub enum Error {
     NoCusfMainchainWalletClient,
     #[error("Failed to request mainchain ancestor info for {block_hash}")]
     RequestMainchainAncestorInfos { block_hash: bitcoin::BlockHash },
+    #[error("Failed to submit transaction")]
+    SubmitTransaction(#[from] node::error::SubmitTransaction),
     #[error("Utreexo error: {0}")]
     Utreexo(String),
     #[error("Unable to verify existence of CUSF mainchain service(s) at {url}")]

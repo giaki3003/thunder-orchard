@@ -1,9 +1,11 @@
 use borsh::BorshSerialize;
+use error_fatality::{Fatality, Split};
 use rayon::{
     iter::{IntoParallelRefIterator as _, ParallelIterator as _},
     slice::ParallelSlice as _,
 };
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use utoipa::ToSchema;
 
 use crate::types::{
@@ -22,24 +24,32 @@ pub fn get_address(verifying_key: &VerifyingKey) -> TransparentAddress {
     TransparentAddress(output)
 }
 
-#[derive(Debug, thiserror::Error)]
+/// Non-fatal variants indicate tx rejection reason
+#[derive(Debug, Error, Fatality, Split)]
 pub enum Error {
     #[error("borsh serialization error")]
+    #[fatal(true)]
     BorshSerialize(#[from] borsh::io::Error),
     #[error("ed25519_dalek error")]
+    #[fatal(false)]
     DalekError(#[from] SignatureError),
     #[error("not enough authorizations")]
+    #[fatal(false)]
     NotEnoughAuthorizations,
     #[error("too many authorizations")]
+    #[fatal(false)]
     TooManyAuthorizations,
     #[error("Orchard bundle proof verification error")]
+    #[fatal(false)]
     OrchardProof(#[from] orchard::BundleProofVerificationError),
     #[error("Orchard signature verification error")]
+    #[fatal(false)]
     OrchardSignature(#[from] orchard::SignatureVerificationError),
     #[error(
         "wrong key for address: address = {address},
              hash(verifying_key) = {hash_verifying_key}"
     )]
+    #[fatal(false)]
     WrongKeyForAddress {
         address: TransparentAddress,
         hash_verifying_key: TransparentAddress,

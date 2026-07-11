@@ -1,11 +1,130 @@
+use error_fatality::{Fatality, Split};
 use sneed::{db::error as db, env::error as env, rwtxn::error as rwtxn};
 use thiserror::Error;
 use transitive::Transitive;
 
 use crate::types::{
-    AmountOverflowError, AmountUnderflowError, BlockHash, M6id, MerkleRoot,
-    OutPoint, Txid, UtreexoError, WithdrawalBundleError, orchard,
+    AmountOverflowError, AmountUnderflowError, BlockHash, Hash, M6id,
+    MerkleRoot, OutPoint, TransparentAddress, Txid, UtreexoError,
+    WithdrawalBundleError, orchard,
 };
+
+#[derive(Debug, Error)]
+#[error(
+    "Computed Utxo hash ({}) for input ({}) does not match input hash ({})",
+    hex::encode(.computed),
+    .outpoint,
+    hex::encode(.input_hash),
+)]
+pub struct UtxoHashMismatch {
+    pub(in crate::state) computed: Hash,
+    pub(in crate::state) outpoint: OutPoint,
+    pub(in crate::state) input_hash: Hash,
+}
+
+#[derive(Debug, Error, Fatality, Split)]
+pub enum ValidateFilledTransaction {
+    #[error(transparent)]
+    #[fatal(false)]
+    AmountOverflow(#[from] AmountOverflowError),
+    #[error(transparent)]
+    #[fatal(false)]
+    AmountUnderflow(#[from] AmountUnderflowError),
+    #[error("value in is less than value out")]
+    #[fatal(false)]
+    NotEnoughValueIn,
+    #[error("withdrawal output {outpoint} cannot be spent by a transaction")]
+    #[fatal(false)]
+    SpendWithdrawalOutput { outpoint: OutPoint },
+    #[error(transparent)]
+    #[fatal(false)]
+    UtxoHashMismatch(#[from] Box<UtxoHashMismatch>),
+}
+
+impl From<UtxoHashMismatch> for ValidateFilledTransaction {
+    fn from(err: UtxoHashMismatch) -> Self {
+        Self::UtxoHashMismatch(Box::new(err))
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("utxo {outpoint} doesn't exist")]
+#[repr(transparent)]
+pub struct NoUtxo {
+    pub outpoint: OutPoint,
+}
+
+/// Non-fatal variants indicate tx rejection reason
+#[derive(Debug, Error, Fatality)]
+pub enum FillTransaction {
+    #[error(transparent)]
+    #[fatal(true)]
+    DbTryGet(#[from] Box<db::TryGet>),
+    #[error(transparent)]
+    #[fatal(false)]
+    NoUtxo(#[from] NoUtxo),
+}
+
+impl From<db::TryGet> for FillTransaction {
+    fn from(err: db::TryGet) -> Self {
+        Self::DbTryGet(Box::new(err))
+    }
+}
+
+impl Split for FillTransaction {
+    type Fatal = db::TryGet;
+    type Jfyi = NoUtxo;
+
+    fn split(self) -> std::result::Result<Self::Jfyi, Self::Fatal> {
+        match self {
+            Self::DbTryGet(err) => Err(*err),
+            Self::NoUtxo(jfyi) => Ok(jfyi),
+        }
+    }
+}
+
+/// Non-fatal variants indicate tx rejection reason
+#[derive(Debug, Error, Fatality, Split)]
+pub enum ValidateOrchardAnchor {
+    #[error(transparent)]
+    #[fatal(true)]
+    DbTryGet(#[from] Box<db::TryGet>),
+    #[error("The empty anchor is only allowed if spends are disabled")]
+    #[fatal(false)]
+    EmptyAnchor,
+    #[error("Invalid anchor (`{anchor}`)")]
+    #[fatal(false)]
+    InvalidAnchor { anchor: orchard::Anchor },
+}
+
+impl From<db::TryGet> for ValidateOrchardAnchor {
+    fn from(err: db::TryGet) -> Self {
+        Self::DbTryGet(Box::new(err))
+    }
+}
+
+/// Non-fatal variants indicate tx rejection reason
+#[derive(Debug, Error, Fatality, Split)]
+pub enum ValidateTransaction {
+    #[error("failed to verify authorizations")]
+    #[fatal(forward)]
+    Authorization(#[from] crate::authorization::Error),
+    #[error(transparent)]
+    #[fatal(forward)]
+    Filled(#[from] ValidateFilledTransaction),
+    #[error(transparent)]
+    #[fatal(forward)]
+    FillTransaction(#[from] FillTransaction),
+    #[error("failed to validate orchard anchor")]
+    #[fatal(forward)]
+    OrchardAnchor(#[from] ValidateOrchardAnchor),
+    #[error("wrong verifying key hash ({vk_hash}) for address ({address})")]
+    #[fatal(false)]
+    WrongVerifyingKeyForAddress {
+        address: TransparentAddress,
+        vk_hash: TransparentAddress,
+    },
+}
 
 #[derive(Debug, Error)]
 #[error(
@@ -44,10 +163,6 @@ pub enum Orchard {
     AppendCommitment,
     #[error(transparent)]
     Db(#[from] Box<db::Error>),
-    #[error("The empty anchor is only allowed if spends are disabled")]
-    EmptyAnchor,
-    #[error("Invalid anchor (`{anchor}`)")]
-    InvalidAnchor { anchor: orchard::Anchor },
     #[error("Nullifier missing (`{nullifier}`)")]
     MissingNullifier { nullifier: orchard::Nullifier },
     #[error("Nullifier double spent (`{nullifier}`)")]
@@ -58,12 +173,6 @@ impl From<db::Error> for Orchard {
     fn from(err: db::Error) -> Self {
         Self::Db(Box::new(err))
     }
-}
-
-#[derive(Debug, Error)]
-#[error("utxo {outpoint} doesn't exist")]
-pub struct NoUtxo {
-    pub outpoint: OutPoint,
 }
 
 #[allow(clippy::duplicated_attributes)]
@@ -237,8 +346,6 @@ pub enum Error {
     AuthorizationError,
     #[error(transparent)]
     AmountOverflow(#[from] AmountOverflowError),
-    #[error(transparent)]
-    AmountUnderflow(#[from] AmountUnderflowError),
     #[error("body too large")]
     BodyTooLarge,
     #[error(transparent)]
@@ -249,6 +356,8 @@ pub enum Error {
     ConnectWithdrawalBundleSubmitted(#[from] ConnectWithdrawalBundleSubmitted),
     #[error(transparent)]
     Db(Box<sneed::Error>),
+    #[error("failed to fill inputs for tx ({txid})")]
+    FillTransaction { source: FillTransaction, txid: Txid },
     #[error(transparent)]
     InvalidBody(InvalidBody),
     #[error("invalid header: {0}")]
@@ -261,12 +370,8 @@ pub enum Error {
     NoTip,
     #[error("stxo {outpoint} doesn't exist")]
     NoStxo { outpoint: OutPoint },
-    #[error("value in is less than value out")]
-    NotEnoughValueIn,
     #[error(transparent)]
     NoUtxo(#[from] NoUtxo),
-    #[error("withdrawal output {outpoint} cannot be spent by a transaction")]
-    SpendWithdrawalOutput { outpoint: OutPoint },
     #[error("Withdrawal bundle event block doesn't exist")]
     NoWithdrawalBundleEventBlock,
     #[error("Orchard error")]
@@ -281,17 +386,6 @@ pub enum Error {
     UtreexoRootsMismatch,
     #[error("utxo double spent")]
     UtxoDoubleSpent,
-    #[error(
-        "Computed Utxo hash ({}) for input ({}) does not match input hash ({})",
-        hex::encode(.computed),
-        .outpoint,
-        hex::encode(.input_hash),
-    )]
-    UtxoHashMismatch {
-        computed: crate::types::Hash,
-        outpoint: OutPoint,
-        input_hash: crate::types::Hash,
-    },
     #[error("too many sigops")]
     TooManySigops,
     #[error(
@@ -320,6 +414,16 @@ pub enum Error {
     UnknownWithdrawalBundleReconfirmed {
         event_block_hash: bitcoin::BlockHash,
         m6id: M6id,
+    },
+    #[error("failed to validate tx ({txid})")]
+    ValidateFilledTransaction {
+        source: ValidateFilledTransaction,
+        txid: Txid,
+    },
+    #[error("failed to validate orchard anchor for tx ({txid})")]
+    ValidateOrchardAnchor {
+        source: ValidateOrchardAnchor,
+        txid: Txid,
     },
     #[error("wrong public key for address")]
     WrongPubKeyForAddress,

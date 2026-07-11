@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashMap, HashSet},
+};
 
 use fallible_iterator::FallibleIterator as _;
 use futures::Stream;
@@ -25,16 +28,15 @@ use crate::{
 };
 
 mod block;
-mod error;
+pub mod error;
+pub use error::Error;
 mod orchard;
+pub use orchard::Orchard;
 #[cfg(test)]
 mod orchard_anchor_tests;
 mod rollback;
-mod two_way_peg_data;
-
-pub use error::Error;
-pub use orchard::Orchard;
 use rollback::RollBack;
+mod two_way_peg_data;
 
 pub const WITHDRAWAL_BUNDLE_FAILURE_GAP: u32 = 4;
 
@@ -280,8 +282,8 @@ impl State {
     pub fn fill_transaction(
         &self,
         rotxn: &RoTxn,
-        transaction: &Transaction,
-    ) -> Result<FilledTransaction, Error> {
+        transaction: Cow<'_, Transaction>,
+    ) -> Result<FilledTransaction, error::FillTransaction> {
         let mut spent_utxos = vec![];
         for (outpoint, _) in &transaction.inputs {
             let key = OutPointKey::from(outpoint);
@@ -293,7 +295,7 @@ impl State {
         }
         Ok(FilledTransaction {
             spent_utxos,
-            transaction: transaction.clone(),
+            transaction: transaction.into_owned(),
         })
     }
 
@@ -321,14 +323,14 @@ impl State {
 
     fn validate_utxo_hashes(
         transaction: &FilledTransaction,
-    ) -> Result<(), Error> {
+    ) -> Result<(), error::UtxoHashMismatch> {
         for (outpoint, utxo_hash, output) in transaction.inputs() {
             let outpoint = *outpoint;
             let utxo_hash = *utxo_hash;
             let computed_utxo_hash =
                 crate::types::hash(&PointedOutputRef { outpoint, output });
             if utxo_hash != computed_utxo_hash {
-                return Err(Error::UtxoHashMismatch {
+                return Err(error::UtxoHashMismatch {
                     computed: computed_utxo_hash,
                     outpoint,
                     input_hash: utxo_hash,
@@ -341,7 +343,7 @@ impl State {
     pub fn validate_filled_transaction(
         &self,
         transaction: &FilledTransaction,
-    ) -> Result<bitcoin::Amount, Error> {
+    ) -> Result<bitcoin::Amount, error::ValidateFilledTransaction> {
         let () = Self::validate_utxo_hashes(transaction)?;
         let mut value_in = bitcoin::Amount::ZERO;
         let mut value_out = bitcoin::Amount::ZERO;
@@ -349,9 +351,11 @@ impl State {
             // a withdrawal output is committed to a bundle and can only be
             // spent by the bundle, never by a transaction
             if utxo.content.is_withdrawal() {
-                return Err(Error::SpendWithdrawalOutput {
-                    outpoint: *outpoint,
-                });
+                let err =
+                    error::ValidateFilledTransaction::SpendWithdrawalOutput {
+                        outpoint: *outpoint,
+                    };
+                return Err(err);
             }
             value_in = value_in
                 .checked_add(utxo.get_value())
@@ -377,7 +381,7 @@ impl State {
             }
         }
         if value_out > value_in {
-            return Err(Error::NotEnoughValueIn);
+            return Err(error::ValidateFilledTransaction::NotEnoughValueIn);
         }
         value_in
             .checked_sub(value_out)
@@ -390,19 +394,19 @@ impl State {
         &self,
         rotxn: &RoTxn,
         orchard_bundle: &types::orchard::Bundle<types::orchard::Authorized>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), error::ValidateOrchardAnchor> {
         let anchor = *orchard_bundle.anchor();
         if anchor == types::orchard::Anchor::empty_tree()
             && orchard_bundle.flags().spends_enabled()
         {
-            return Err(error::Orchard::EmptyAnchor.into());
+            return Err(error::ValidateOrchardAnchor::EmptyAnchor);
         }
         if !self
             .orchard
             .historical_roots()
             .contains_key(rotxn, &anchor)?
         {
-            return Err(error::Orchard::InvalidAnchor { anchor }.into());
+            return Err(error::ValidateOrchardAnchor::InvalidAnchor { anchor });
         }
         Ok(())
     }
@@ -411,16 +415,22 @@ impl State {
         &self,
         rotxn: &RoTxn,
         transaction: &AuthorizedTransaction,
-    ) -> Result<bitcoin::Amount, Error> {
-        let filled_transaction =
-            self.fill_transaction(rotxn, &transaction.transaction)?;
+    ) -> Result<bitcoin::Amount, error::ValidateTransaction> {
+        let filled_transaction = self
+            .fill_transaction(rotxn, Cow::Borrowed(&transaction.transaction))?;
         for (authorization, spent_utxo) in transaction
             .authorizations
             .iter()
             .zip(filled_transaction.spent_utxos.iter())
         {
-            if authorization.get_address() != spent_utxo.address {
-                return Err(Error::WrongPubKeyForAddress);
+            let auth_address = authorization.get_address();
+            if auth_address != spent_utxo.address {
+                let err =
+                    error::ValidateTransaction::WrongVerifyingKeyForAddress {
+                        address: spent_utxo.address,
+                        vk_hash: auth_address,
+                    };
+                return Err(err);
             }
         }
         // Check anchor
@@ -429,9 +439,7 @@ impl State {
         {
             let () = self.validate_orchard_anchor(rotxn, orchard_bundle)?;
         }
-        if Authorization::verify_transaction(transaction).is_err() {
-            return Err(Error::AuthorizationError);
-        }
+        let () = Authorization::verify_transaction(transaction)?;
         let fee = self.validate_filled_transaction(&filled_transaction)?;
         Ok(fee)
     }
@@ -665,7 +673,7 @@ mod test {
     use bitcoin::hashes::Hash as _;
 
     use crate::{
-        state::State,
+        state::{State, error},
         types::{
             FilledTransaction, InPoint, OutPoint, OutPointKey, Output,
             OutputContent, PointedOutputRef, SpentOutput, Transaction,
@@ -749,7 +757,7 @@ mod test {
         };
         assert!(matches!(
             state.validate_filled_transaction(&tx),
-            Err(crate::state::Error::SpendWithdrawalOutput { .. })
+            Err(error::ValidateFilledTransaction::SpendWithdrawalOutput { .. })
         ));
         Ok(())
     }

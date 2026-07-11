@@ -1,6 +1,6 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
-    fmt::Debug,
     net::SocketAddr,
     path::Path,
     sync::Arc,
@@ -10,14 +10,14 @@ use bitcoin::amount::CheckedSum;
 use fallible_iterator::{FallibleIterator as _, IteratorExt as _};
 use futures::{Stream, future::BoxFuture};
 use heed::EnvFlags;
-use sneed::{DbError, Env, EnvError, RoTxn, RwTxnError, env};
+use sneed::{DbError, Env, EnvError, RoTxn, RwTxnError};
 use tokio::sync::Mutex;
 use tonic::transport::Channel;
 
 use crate::{
-    archive::{self, Archive},
+    archive::Archive,
     mempool::{self, MemPool},
-    net::{self, Net, Peer},
+    net::{Net, Peer},
     state::{self, State},
     types::{
         Accumulator, AmountOverflowError, AmountUnderflowError,
@@ -29,75 +29,12 @@ use crate::{
     util::Watchable,
 };
 
+pub mod error;
+pub use error::Error;
 mod mainchain_task;
-mod net_task;
-
 use mainchain_task::MainchainTaskHandle;
-
-use self::net_task::NetTaskHandle;
-
-#[derive(Debug, thiserror::Error, transitive::Transitive)]
-#[transitive(from(env::error::ReadTxn, EnvError))]
-pub enum Error {
-    #[error("address parse error")]
-    AddrParse(#[from] std::net::AddrParseError),
-    #[error(transparent)]
-    AmountOverflow(#[from] AmountOverflowError),
-    #[error(transparent)]
-    AmountUnderflow(#[from] AmountUnderflowError),
-    #[error("archive error")]
-    Archive(#[from] archive::Error),
-    #[error("CUSF mainchain proto error")]
-    CusfMainchain(#[from] proto::Error),
-    #[error(transparent)]
-    Db(#[from] DbError),
-    #[error("Database env error")]
-    DbEnv(#[from] EnvError),
-    #[error("Database write error")]
-    DbWrite(#[from] RwTxnError),
-    #[error("I/O error")]
-    Io(#[from] std::io::Error),
-    #[error("error requesting mainchain ancestors")]
-    MainchainAncestors(#[source] mainchain_task::ResponseError),
-    #[error("mempool error")]
-    MemPool(#[from] mempool::Error),
-    #[error("net error")]
-    Net(#[from] Box<net::Error>),
-    #[error("net task error")]
-    NetTask(#[source] Box<net_task::Error>),
-    #[error("No CUSF mainchain wallet client")]
-    NoCusfMainchainWalletClient,
-    #[error("peer info stream closed")]
-    PeerInfoRxClosed,
-    #[error("Receive mainchain task response cancelled")]
-    ReceiveMainchainTaskResponse,
-    #[error("Send mainchain task request failed")]
-    SendMainchainTaskRequest,
-    #[error("state error")]
-    State(#[source] Box<state::Error>),
-    #[error("Utreexo error: {0}")]
-    Utreexo(String),
-    #[error("Verify BMM error")]
-    VerifyBmm(anyhow::Error),
-}
-
-impl From<net::Error> for Error {
-    fn from(err: net::Error) -> Self {
-        Self::Net(Box::new(err))
-    }
-}
-
-impl From<net_task::Error> for Error {
-    fn from(err: net_task::Error) -> Self {
-        Self::NetTask(Box::new(err))
-    }
-}
-
-impl From<state::Error> for Error {
-    fn from(err: state::Error) -> Self {
-        Self::State(Box::new(err))
-    }
-}
+mod net_task;
+use net_task::NetTaskHandle;
 
 #[derive(Clone)]
 pub struct Node<MainchainTransport = Channel> {
@@ -253,12 +190,12 @@ where
     pub fn submit_transaction(
         &self,
         transaction: AuthorizedTransaction,
-    ) -> Result<(), Error> {
+    ) -> Result<(), error::SubmitTransaction> {
         {
-            let mut rotxn = self.env.write_txn().map_err(EnvError::from)?;
-            self.state.validate_transaction(&rotxn, &transaction)?;
-            self.mempool.put(&mut rotxn, &transaction)?;
-            rotxn.commit().map_err(RwTxnError::from)?;
+            let mut rwtxn = self.env.write_txn()?;
+            self.state.validate_transaction(&rwtxn, &transaction)?;
+            self.mempool.insert(&mut rwtxn, &transaction)?;
+            rwtxn.commit()?;
         }
         self.net.push_tx(Default::default(), transaction);
         Ok(())
@@ -268,7 +205,7 @@ where
         let rotxn = self.env.read_txn().map_err(EnvError::from)?;
         self.state
             .get_utxos(&rotxn)
-            .map_err(|err| DbError::from(err).into())
+            .map_err(|err| state::Error::from(err).into())
     }
 
     pub fn get_latest_failed_withdrawal_bundle_height(
@@ -449,28 +386,39 @@ where
         &self,
         number: usize,
     ) -> Result<(Vec<AuthorizedTransaction>, bitcoin::Amount), Error> {
-        let mut txn = self.env.write_txn().map_err(EnvError::from)?;
-        let transactions = self.mempool.take(&txn, number)?;
+        let mut rwtxn = self.env.write_txn()?;
+        let transactions = self.mempool.take(&rwtxn, number)?;
         let mut fee = bitcoin::Amount::ZERO;
         let mut returned_transactions = vec![];
         let mut spent_utxos = HashSet::new();
         for transaction in &transactions {
+            let txid =
+                std::cell::LazyCell::new(|| transaction.transaction.txid());
             let inputs: HashSet<_> =
                 transaction.transaction.inputs.iter().copied().collect();
             if !spent_utxos.is_disjoint(&inputs) {
                 // UTXO double spent
-                self.mempool
-                    .delete(&mut txn, transaction.transaction.txid())?;
+                self.mempool.delete(&mut rwtxn, *txid)?;
                 continue;
             }
-            if self.state.validate_transaction(&txn, transaction).is_err() {
-                self.mempool
-                    .delete(&mut txn, transaction.transaction.txid())?;
+            if self
+                .state
+                .validate_transaction(&rwtxn, transaction)
+                .is_err()
+            {
+                self.mempool.delete(&mut rwtxn, *txid)?;
                 continue;
             }
             let filled_transaction = self
                 .state
-                .fill_transaction(&txn, &transaction.transaction)?;
+                .fill_transaction(
+                    &rwtxn,
+                    Cow::Borrowed(&transaction.transaction),
+                )
+                .map_err(|err| state::Error::FillTransaction {
+                    source: err,
+                    txid: *txid,
+                })?;
             let mut value_in: bitcoin::Amount = filled_transaction
                 .spent_utxos
                 .iter()
@@ -508,7 +456,7 @@ where
             returned_transactions.push(transaction.clone());
             spent_utxos.extend(transaction.transaction.inputs.clone());
         }
-        txn.commit().map_err(RwTxnError::from)?;
+        rwtxn.commit()?;
         Ok((returned_transactions, fee))
     }
 

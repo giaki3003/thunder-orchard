@@ -1,5 +1,7 @@
 //! Connect and disconnect blocks
 
+use std::borrow::Cow;
+
 use rayon::prelude::*;
 use rustreexo::accumulator::node_hash::BitcoinNodeHash;
 use sneed::{RoTxn, RwTxn};
@@ -71,7 +73,14 @@ pub fn validate(
     let filled_transactions: Vec<_> = body
         .transactions
         .iter()
-        .map(|t| state.fill_transaction(rotxn, t))
+        .map(|t| {
+            state
+                .fill_transaction(rotxn, Cow::Borrowed(t))
+                .map_err(|err| Error::FillTransaction {
+                    source: err,
+                    txid: t.txid(),
+                })
+        })
         .collect::<Result<_, _>>()?;
     let total_inputs = calculate_total_inputs(body);
 
@@ -96,7 +105,12 @@ pub fn validate(
         if let Some(orchard_bundle) =
             filled_transaction.transaction.orchard_bundle.as_ref()
         {
-            let () = state.validate_orchard_anchor(rotxn, orchard_bundle)?;
+            let () = state
+                .validate_orchard_anchor(rotxn, orchard_bundle)
+                .map_err(|err| Error::ValidateOrchardAnchor {
+                    source: err,
+                    txid,
+                })?;
         }
         // hashes of spent utxos, used to verify the utreexo proof
         let mut spent_utxo_hashes = Vec::<BitcoinNodeHash>::with_capacity(
@@ -120,7 +134,14 @@ pub fn validate(
             accumulator_diff.insert((&pointed_output).into());
         }
         total_fees = total_fees
-            .checked_add(state.validate_filled_transaction(filled_transaction)?)
+            .checked_add(
+                state
+                    .validate_filled_transaction(filled_transaction)
+                    .map_err(|err| Error::ValidateFilledTransaction {
+                        source: err,
+                        txid,
+                    })?,
+            )
             .ok_or(AmountOverflowError)?;
         // verify utreexo proof
         if !accumulator
@@ -205,7 +226,14 @@ pub fn prevalidate(
     let filled_transactions: Vec<_> = body
         .transactions
         .iter()
-        .map(|t| state.fill_transaction(rotxn, t))
+        .map(|t| {
+            state
+                .fill_transaction(rotxn, Cow::Borrowed(t))
+                .map_err(|err| Error::FillTransaction {
+                    source: err,
+                    txid: t.txid(),
+                })
+        })
         .collect::<Result<_, _>>()?;
     let total_inputs = calculate_total_inputs(body);
 
@@ -230,7 +258,12 @@ pub fn prevalidate(
         if let Some(orchard_bundle) =
             filled_transaction.transaction.orchard_bundle.as_ref()
         {
-            let () = state.validate_orchard_anchor(rotxn, orchard_bundle)?;
+            let () = state
+                .validate_orchard_anchor(rotxn, orchard_bundle)
+                .map_err(|err| Error::ValidateOrchardAnchor {
+                    source: err,
+                    txid,
+                })?;
         }
         // hashes of spent utxos, used to verify the utreexo proof
         let mut spent_utxo_hashes = Vec::<BitcoinNodeHash>::with_capacity(
@@ -254,7 +287,14 @@ pub fn prevalidate(
             accumulator_diff.insert((&pointed_output).into());
         }
         total_fees = total_fees
-            .checked_add(state.validate_filled_transaction(filled_transaction)?)
+            .checked_add(
+                state
+                    .validate_filled_transaction(filled_transaction)
+                    .map_err(|err| Error::ValidateFilledTransaction {
+                        source: err,
+                        txid,
+                    })?,
+            )
             .ok_or(AmountOverflowError)?;
         // verify utreexo proof
         if !accumulator
@@ -709,6 +749,8 @@ pub fn disconnect_tip(
 
 #[cfg(test)]
 mod test {
+    use std::borrow::Cow;
+
     use crate::state::test::{fresh_state, value_output};
 
     #[test]
@@ -812,7 +854,10 @@ mod test {
         //   builds from the SUPPLIED utxo_hash.
         let filled = {
             let rotxn = env.read_txn()?;
-            state.fill_transaction(&rotxn, &body.transactions[0])?
+            state.fill_transaction(
+                &rotxn,
+                Cow::Borrowed(&body.transactions[0]),
+            )?
         };
 
         // tx validation REJECTS the outpoint/utxo_hash mismatch.
