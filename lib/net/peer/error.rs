@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::net::peer::PeerStateId;
+use crate::{net::peer::PeerStateId, state::error as state, types::Txid};
 
 pub(in crate::net::peer) mod connection {
     use thiserror::Error;
@@ -305,6 +305,11 @@ pub enum Error {
     SendResponse(#[from] connection::SendResponse),
     #[error("state error")]
     State(#[from] Box<crate::state::Error>),
+    #[error("failed to validate tx ({txid})")]
+    ValidateTransaction {
+        source: state::ValidateTransaction,
+        txid: Txid,
+    },
 }
 
 impl From<crate::state::Error> for Error {

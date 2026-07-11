@@ -252,7 +252,10 @@ fn disconnect_tip_(
         prev_frontier.as_ref(),
     )?;
     for transaction in tip_body.authorized_transactions().iter().rev() {
-        mempool.put(rwtxn, transaction)?;
+        let _: Result<(), mempool::error::TxRejected> = mempool
+            .insert(rwtxn, transaction)
+            .into_nested()
+            .map_err(mempool::Error::from)?;
     }
     mempool.regenerate_proofs(rwtxn, &prev_accumulator)?;
     Ok(())
@@ -1160,30 +1163,34 @@ impl NetTask {
                             // nullifier already held). Such conflicts are not
                             // fatal to this node: drop the transaction without
                             // relaying instead of terminating the net task.
-                            match self.ctxt.mempool.put(&mut rwtxn, &new_tx) {
-                                Ok(()) => {}
-                                Err(
-                                    err @ (mempool::Error::UtxoDoubleSpent {
-                                        ..
-                                    }
-                                    | mempool::Error::NullifierDoubleSpent {
-                                        ..
-                                    }),
-                                ) => {
+                            match self
+                                .ctxt
+                                .mempool
+                                .insert(&mut rwtxn, &new_tx)
+                                .into_nested()
+                                .map_err(mempool::Error::from)?
+                            {
+                                Ok(()) => {
+                                    rwtxn.commit()?;
+                                    // broadcast
+                                    let () = self.ctxt.net.push_tx(
+                                        HashSet::from_iter([addr]),
+                                        *new_tx,
+                                    );
+                                }
+                                Err(jfyi) => {
+                                    drop(rwtxn);
+                                    let reason: mempool::error::TxRejected =
+                                        jfyi;
+                                    let txid = new_tx.transaction.txid();
                                     tracing::warn!(
                                         %addr,
-                                        "Dropping conflicting transaction from peer: {err}"
+                                        %txid,
+                                        "Dropping conflicting transaction from peer: {:#}",
+                                        ErrorChain::new(&reason),
                                     );
-                                    continue;
                                 }
-                                Err(err) => return Err(err.into()),
                             }
-                            rwtxn.commit().map_err(RwTxnError::from)?;
-                            // broadcast
-                            let () = self
-                                .ctxt
-                                .net
-                                .push_tx(HashSet::from_iter([addr]), *new_tx);
                         }
                         PeerConnectionInfo::Response(boxed) => {
                             let (resp, req) = *boxed;
@@ -1329,7 +1336,7 @@ mod test {
     // a peer's invalid block (value out > value in) must not be fatal
     #[test]
     fn invalid_peer_block_is_not_fatal() {
-        let err = Error::State(Box::new(state::Error::NotEnoughValueIn));
+        let err = Error::State(Box::new(state::Error::NotEnoughFees));
         assert!(!is_fatal_reorg_error(&err));
     }
 

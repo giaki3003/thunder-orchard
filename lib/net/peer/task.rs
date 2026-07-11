@@ -660,6 +660,7 @@ impl ConnectionTask {
         response_tx: SendStream,
         tx: Box<AuthorizedTransaction>,
     ) -> Result<(), Error> {
+        use error_fatality::Fatality as _;
         let txid = tx.transaction.txid();
         let validate_tx_result = {
             let rotxn = ctxt.env.read_txn().map_err(EnvError::from)?;
@@ -667,13 +668,15 @@ impl ConnectionTask {
         };
         match validate_tx_result {
             Err(err) => {
-                Connection::send_response(
-                    ctxt.network,
-                    response_tx,
-                    ResponseMessage::TransactionRejected(txid),
-                )
-                .await?;
-                Err(Error::from(err))
+                if !err.is_fatal() {
+                    Connection::send_response(
+                        ctxt.network,
+                        response_tx,
+                        ResponseMessage::TransactionRejected(txid),
+                    )
+                    .await?;
+                }
+                Err(Error::ValidateTransaction { source: err, txid })
             }
             Ok(_) => {
                 Connection::send_response(

@@ -2,62 +2,15 @@ use std::collections::VecDeque;
 
 use fallible_iterator::FallibleIterator as _;
 use heed::types::SerdeBincode;
-use sneed::{DatabaseUnique, RoTxn, RwTxn, RwTxnError, UnitKey, db, env};
-use thiserror::Error;
-use transitive::Transitive;
+use sneed::{DatabaseUnique, RoTxn, RwTxn, RwTxnError, UnitKey};
 
 use crate::types::{
-    Accumulator, AuthorizedTransaction, Body, OutPoint, Txid, UtreexoError,
-    VERSION, Version, orchard::Nullifier,
+    Accumulator, AuthorizedTransaction, Body, OutPoint, Txid, VERSION, Version,
+    orchard::Nullifier,
 };
 
-#[allow(clippy::duplicated_attributes)]
-#[derive(Debug, Error, Transitive)]
-#[transitive(
-    from(db::error::Delete, db::Error),
-    from(db::error::Get, db::Error),
-    from(db::error::IterInit, db::Error),
-    from(db::error::IterItem, db::Error),
-    from(db::error::Put, db::Error),
-    from(db::error::TryGet, db::Error),
-    from(env::error::CreateDb, env::Error),
-    from(env::error::WriteTxn, env::Error)
-)]
-pub enum Error {
-    #[error(transparent)]
-    Db(#[from] Box<db::Error>),
-    #[error("Database env error")]
-    DbEnv(#[from] Box<env::Error>),
-    #[error("Database write error")]
-    DbWrite(#[from] RwTxnError),
-    #[error(
-        "can't add transaction (`{}`), nullifier (`{}`) already used by (`{}`)",
-        .new_txid,
-        .nullifier,
-        .old_txid,
-    )]
-    NullifierDoubleSpent {
-        new_txid: Txid,
-        nullifier: Nullifier,
-        old_txid: Txid,
-    },
-    #[error(transparent)]
-    Utreexo(#[from] UtreexoError),
-    #[error("can't add transaction (`{txid}`), utxo double spent")]
-    UtxoDoubleSpent { txid: Txid },
-}
-
-impl From<db::Error> for Error {
-    fn from(err: db::Error) -> Self {
-        Self::Db(Box::new(err))
-    }
-}
-
-impl From<env::Error> for Error {
-    fn from(err: env::Error) -> Self {
-        Self::DbEnv(Box::new(err))
-    }
-}
+pub mod error;
+pub use error::Error;
 
 #[derive(Clone)]
 pub struct MemPool {
@@ -94,36 +47,40 @@ impl MemPool {
         })
     }
 
-    pub fn put(
+    pub fn insert(
         &self,
         rwtxn: &mut RwTxn,
         transaction: &AuthorizedTransaction,
-    ) -> Result<(), Error> {
+    ) -> Result<(), error::Insert> {
         let txid = transaction.transaction.txid();
         if self.transactions.contains_key(rwtxn, &txid)? {
             tracing::debug!(%txid, "transaction already in mempool");
             return Ok(());
         }
         tracing::debug!("adding transaction {txid} to mempool");
-        for (outpoint, _) in &transaction.transaction.inputs {
-            if self.spent_utxos.try_get(rwtxn, outpoint)?.is_some() {
-                return Err(Error::UtxoDoubleSpent {
-                    txid: transaction.transaction.txid(),
-                });
+        for (vin, (outpoint, _)) in
+            transaction.transaction.inputs.iter().enumerate()
+        {
+            if let Some(conflicts_with) =
+                self.spent_utxos.try_get(rwtxn, outpoint)?
+            {
+                let err = error::TxRejected::UtxoDoubleSpent {
+                    double_spent_vin: vin,
+                    conflicts_with,
+                };
+                return Err(err.into());
             }
             self.spent_utxos.put(rwtxn, outpoint, &txid)?;
         }
         if let Some(orchard_bundle) = &transaction.transaction.orchard_bundle {
             for nullifier in orchard_bundle.nullifiers() {
-                if let Some(old_txid) =
+                if let Some(conflicts_with) =
                     self.used_nullifiers.try_get(rwtxn, nullifier)?
                 {
-                    let err = Error::NullifierDoubleSpent {
-                        new_txid: txid,
-                        nullifier: *nullifier,
-                        old_txid,
+                    let err = error::TxRejected::NullifierDoubleSpent {
+                        conflicts_with,
                     };
-                    return Err(err);
+                    return Err(err.into());
                 }
                 self.used_nullifiers.put(rwtxn, nullifier, &txid)?;
             }

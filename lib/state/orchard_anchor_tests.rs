@@ -21,6 +21,7 @@ use crate::{
     state::{
         State,
         error::{self, Error},
+        test::fresh_state,
     },
     types::{
         AccumulatorDiff, AuthorizedTransaction, Body, Header, OutPoint, Output,
@@ -31,31 +32,6 @@ use crate::{
 
 // The forged note's value: 1,000,000 BTC in sats. Fits in i64 value_balance.
 const FORGED_SATS: u64 = 1_000_000 * 100_000_000;
-
-/// Temp directory for an LMDB env, removed on drop.
-struct TempDir(std::path::PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "thunder_orchard_anchor_test_{}_{nanos}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _unused = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// Build a position-0 merkle path and the resulting anchor for a single leaf,
 /// without ever inserting the leaf into the chain's note-commitment tree.
@@ -228,35 +204,30 @@ fn expected_roots(
 }
 
 #[test]
-fn forged_anchor_rejected_in_block() {
-    let tmp = TempDir::new();
-    let env = {
-        let mut opts = heed::EnvOpenOptions::new();
-        opts.map_size(1024 * 1024 * 1024).max_dbs(State::NUM_DBS);
-        unsafe { sneed::Env::open(&opts, &tmp.0) }.unwrap()
-    };
-    let state = State::new(&env).unwrap();
+fn forged_anchor_rejected_in_block() -> anyhow::Result<()> {
+    let (_temp_dir, env, state) =
+        fresh_state("forged_anchor_rejected_in_block")?;
 
     let attacker_addr = TransparentAddress([0x11; 20]);
     let empty_proof = {
-        let rotxn = env.read_txn().unwrap();
-        state
-            .get_utreexo_proof(&rotxn, std::iter::empty::<&PointedOutput>())
-            .unwrap()
+        let rotxn = env.read_txn()?;
+        state.get_utreexo_proof(&rotxn, std::iter::empty::<&PointedOutput>())?
     };
 
     let auth_tx = build_attack_tx(attacker_addr, empty_proof);
 
     // Mempool path must reject the forged anchor.
     {
-        let rotxn = env.read_txn().unwrap();
+        let rotxn = env.read_txn()?;
         let err = state
             .validate_transaction(&rotxn, &auth_tx)
             .expect_err("mempool must reject forged anchor");
-        assert!(
-            matches!(err, Error::Orchard(error::Orchard::InvalidAnchor { .. })),
-            "expected InvalidAnchor, got: {err:?}"
-        );
+        anyhow::ensure!(matches!(
+            err,
+            error::ValidateTransaction::OrchardAnchor(
+                error::ValidateOrchardAnchor::InvalidAnchor { .. }
+            )
+        ),);
     }
 
     // Block-validation path must reject the same transaction. Before the fix,
@@ -272,13 +243,17 @@ fn forged_anchor_rejected_in_block() {
         }
     };
     {
-        let rotxn = env.read_txn().unwrap();
+        let rotxn = env.read_txn()?;
         let err = state
             .validate_block(&rotxn, &header, &body)
             .expect_err("block path must reject forged anchor");
-        assert!(
-            matches!(err, Error::Orchard(error::Orchard::InvalidAnchor { .. })),
-            "expected InvalidAnchor, got: {err:?}"
-        );
+        anyhow::ensure!(matches!(
+            err,
+            Error::ValidateOrchardAnchor {
+                source: error::ValidateOrchardAnchor::InvalidAnchor { .. },
+                txid: _,
+            }
+        ));
     }
+    Ok(())
 }
